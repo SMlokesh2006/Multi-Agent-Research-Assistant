@@ -1,0 +1,491 @@
+"""Supervisor agent — orchestrates the multi-agent research pipeline.
+
+This is the central routing node. It uses Gemini Flash with tool-calling
+to decide which sub-agent to invoke next, decomposes research questions
+into search sub-queries, tracks iteration counts, and triggers
+human-in-the-loop reviews when the analyst flags ambiguity.
+
+The supervisor operates in a loop:
+    1. First call → decompose query into search sub-queries → fan-out via Send.
+    2. Subsequent calls → inspect current state and route to the next agent.
+    3. Terminal call → return ``finish`` or ``request_human_input``.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any, Literal
+
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.types import Send
+
+from src.config import settings
+from src.state import AnalysisResult, ResearchState
+from src.utils.cache import get_cache
+from src.utils.rate_limiter import get_rate_limiter
+
+logger = logging.getLogger(__name__)
+
+# The tools the supervisor can "call" — modelled as plain dicts so we
+# can use Gemini's function-calling interface.
+_SUPERVISOR_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search",
+            "description": (
+                "Search the web for information. Use this when you need to "
+                "gather information on a topic. Provide a list of search queries."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "queries": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "2-4 focused search queries to investigate the research question.",
+                    }
+                },
+                "required": ["queries"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_content",
+            "description": (
+                "Extract and read the full content of web pages found by search. "
+                "Use after search results are available."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze",
+            "description": (
+                "Analyse scraped content to extract findings, conflicts, and gaps. "
+                "Use after content has been read."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_report",
+            "description": (
+                "Generate a final research report from the analysis. "
+                "Use after analysis is complete and no further research is needed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "request_human_input",
+            "description": (
+                "Request human review and feedback before proceeding. "
+                "Use when there are significant conflicts or ambiguity."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Why human input is needed.",
+                    }
+                },
+                "required": ["reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finish",
+            "description": (
+                "End the research pipeline. Use when the report is complete "
+                "or max iterations have been reached."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+]
+
+_SUPERVISOR_SYSTEM = """\
+You are the Supervisor of a multi-agent research team. Your role is to
+coordinate the research pipeline by deciding which action to take next.
+
+Available actions:
+- search: Search the web (provide 2-4 focused queries)
+- read_content: Extract full content from search result URLs
+- analyze: Analyse all scraped content for findings and conflicts
+- write_report: Generate the final research report
+- request_human_input: Ask the human for guidance (use when conflicts/ambiguity exist)
+- finish: End the pipeline (only after report is complete)
+
+Decision rules:
+1. If no search has been done yet → search.
+2. If search results exist but content hasn't been read → read_content.
+3. If content has been read but not analysed → analyze.
+4. If analysis shows major gaps AND iterations remain → search with follow-up queries.
+5. If analysis is complete and human review is flagged → request_human_input.
+6. If analysis is complete (or human has responded) → write_report.
+7. If report is complete → finish.
+8. NEVER exceed max_iterations — if at limit, go to write_report or finish.
+
+Always call exactly ONE tool per response.
+"""
+
+
+# ── Helpers ──────────────────────────────────────────────────
+
+
+def _build_llm() -> ChatGoogleGenerativeAI:
+    """Create a Gemini Flash LLM instance configured for tool calling."""
+    return ChatGoogleGenerativeAI(
+        model=settings.gemini.model,
+        temperature=0.1,  # Low temperature for deterministic routing
+        max_output_tokens=1024,  # Routing decisions are short
+        google_api_key=settings.google_api_key,
+    )
+
+
+def _build_state_summary(state: ResearchState) -> str:
+    """Build a concise text summary of current pipeline state for the LLM."""
+    parts: list[str] = []
+    parts.append(f"Research query: {state.get('query', '')}")
+    parts.append(f"Current status: {state.get('status', 'initialized')}")
+    parts.append(f"Iteration: {state.get('iteration', 0)} / {state.get('max_iterations', 3)}")
+
+    search_results = state.get("search_results", [])
+    parts.append(f"Search results collected: {len(search_results)}")
+
+    scraped = state.get("scraped_content", [])
+    parts.append(f"Pages scraped: {len(scraped)}")
+
+    analysis = state.get("analysis")
+    if analysis:
+        a = AnalysisResult.from_dict(analysis)
+        parts.append(f"Analysis: {len(a.key_findings)} findings, {len(a.conflicts)} conflicts")
+        parts.append(f"Knowledge gaps: {len(a.knowledge_gaps)}")
+        parts.append(f"Needs human review: {a.needs_human_review}")
+        if a.follow_up_queries:
+            parts.append(f"Suggested follow-ups: {a.follow_up_queries}")
+    else:
+        parts.append("Analysis: not yet performed")
+
+    report = state.get("report", "")
+    parts.append(f"Report written: {'yes' if report else 'no'}")
+
+    human_feedback = state.get("human_feedback")
+    if human_feedback:
+        parts.append(f"Human feedback received: {human_feedback}")
+
+    errors = state.get("errors", [])
+    if errors:
+        parts.append(f"Errors ({len(errors)}): {errors[-3:]}")  # last 3
+
+    return "\n".join(parts)
+
+
+async def plan_research(query: str) -> list[str]:
+    """Decompose a research question into 2-4 focused search queries.
+
+    Uses Gemini Flash to generate diverse, specific search queries that
+    together cover the research question comprehensively.
+
+    Args:
+        query: The user's research question.
+
+    Returns:
+        List of 2-4 search query strings.
+    """
+    llm = _build_llm()
+    limiter = get_rate_limiter(rpm=settings.gemini.rpm_limit)
+    cache = get_cache(
+        db_path=settings.cache.db_path,
+        search_ttl_hours=settings.cache.search_ttl_hours,
+        page_ttl_hours=settings.cache.page_ttl_hours,
+        llm_ttl_hours=settings.cache.llm_ttl_hours,
+    )
+
+    # ── Cache check ──────────────────────────────────────────
+    cache_key = f"plan:{query}"
+    cached = await cache.get("llm", cache_key)
+    if cached is not None:
+        logger.info("plan_research: returning cached queries")
+        return cached  # type: ignore[return-value]
+
+    prompt = (
+        f"You are a research planner. Given the following research question, "
+        f"generate 2-4 diverse, specific search queries that together would "
+        f"comprehensively investigate the topic. Return ONLY a JSON array of "
+        f"strings, no other text.\n\n"
+        f"Research question: {query}\n\n"
+        f"JSON array of search queries:"
+    )
+
+    async def _invoke():
+        response = await llm.ainvoke(prompt)
+        return response.content
+
+    raw = await limiter.execute_with_retry(_invoke)
+
+    # Parse the JSON array from the response
+    text = raw.strip()
+    if text.startswith("```"):
+        first_nl = text.index("\n")
+        text = text[first_nl + 1 :]
+    if text.endswith("```"):
+        text = text[: -len("```")]
+    text = text.strip()
+
+    try:
+        queries = json.loads(text)
+        if not isinstance(queries, list):
+            queries = [query]  # fallback to original query
+    except json.JSONDecodeError:
+        logger.warning(f"plan_research: failed to parse queries, using original")
+        queries = [query]
+
+    # Ensure we have 2-4 queries
+    queries = queries[:4]
+    if not queries:
+        queries = [query]
+
+    await cache.set("llm", cache_key, queries)
+    logger.info(f"plan_research: generated {len(queries)} queries")
+    return queries
+
+
+# ── Route Decision Types ─────────────────────────────────────
+
+# Possible next-node names that the graph can route to.
+NextNode = Literal[
+    "web_searcher",
+    "content_reader",
+    "analyst",
+    "writer",
+    "human_review",
+    "__end__",
+]
+
+
+async def supervisor(state: ResearchState) -> dict[str, Any]:
+    """Decide and route to the next step in the research pipeline.
+
+    This function is called repeatedly by LangGraph. On each invocation it
+    inspects the current state, calls Gemini to decide the next action,
+    and returns a state update that the graph's conditional edges can use
+    for routing.
+
+    Returns a partial state update. The ``next`` field is consumed by
+    the graph's routing logic (not part of ResearchState itself — it's
+    typically read via a Command or conditional edge function).
+
+    Args:
+        state: The shared research state.
+
+    Returns:
+        Partial state update with routing metadata.
+    """
+    query = state.get("query", "")
+    status = state.get("status", "initialized")
+    iteration = state.get("iteration", 0)
+    max_iterations = state.get("max_iterations", 3)
+
+    logger.info(
+        f"supervisor: status={status}, iteration={iteration}/{max_iterations}"
+    )
+
+    # ── Fast-path: first invocation → plan and search ────────
+    if status == "initialized" and not state.get("search_results"):
+        search_queries = await plan_research(query)
+        return {
+            "search_queries": search_queries,
+            "status": "searching",
+            "iteration": iteration + 1,
+            "next": "web_searcher",
+        }
+
+    # ── Fast-path: max iterations reached ────────────────────
+    if iteration >= max_iterations:
+        logger.warning("supervisor: max iterations reached")
+        if state.get("report"):
+            return {"status": "complete", "next": "__end__"}
+        if state.get("analysis"):
+            return {"status": "writing", "next": "writer"}
+        # Force finish if we have nothing
+        return {
+            "status": "complete",
+            "next": "__end__",
+            "errors": ["supervisor: max iterations reached without completing research"],
+        }
+
+    # ── LLM-based routing for all other states ───────────────
+    llm = _build_llm()
+    limiter = get_rate_limiter(rpm=settings.gemini.rpm_limit)
+
+    state_summary = _build_state_summary(state)
+    messages = [
+        SystemMessage(content=_SUPERVISOR_SYSTEM),
+        HumanMessage(content=f"Current pipeline state:\n{state_summary}\n\nDecide the next action."),
+    ]
+
+    try:
+
+        async def _invoke():
+            return await llm.ainvoke(
+                messages,
+                tools=_SUPERVISOR_TOOLS,
+            )
+
+        response = await limiter.execute_with_retry(_invoke)
+
+    except Exception as exc:
+        error_msg = f"supervisor: LLM routing failed: {exc}"
+        logger.error(error_msg)
+        # Deterministic fallback based on state
+        return _fallback_route(state)
+
+    # ── Parse tool call from response ────────────────────────
+    return _parse_tool_call(response, state)
+
+
+def _parse_tool_call(response: Any, state: ResearchState) -> dict[str, Any]:
+    """Extract the supervisor's routing decision from the LLM response.
+
+    Handles both tool_calls on the response and plain-text fallback.
+    """
+    iteration = state.get("iteration", 0)
+
+    # Check for tool calls
+    if hasattr(response, "tool_calls") and response.tool_calls:
+        tool_call = response.tool_calls[0]
+        tool_name = tool_call.get("name", "")
+        tool_args = tool_call.get("args", {})
+
+        logger.info(f"supervisor: LLM chose tool '{tool_name}'")
+
+        if tool_name == "search":
+            queries = tool_args.get("queries", [])
+            return {
+                "search_queries": queries,
+                "status": "searching",
+                "iteration": iteration + 1,
+                "next": "web_searcher",
+            }
+        elif tool_name == "read_content":
+            return {"status": "reading", "next": "content_reader"}
+        elif tool_name == "analyze":
+            return {"status": "analysing", "next": "analyst"}
+        elif tool_name == "write_report":
+            return {"status": "writing", "next": "writer"}
+        elif tool_name == "request_human_input":
+            reason = tool_args.get("reason", "Human review requested")
+            return {
+                "status": "awaiting_human",
+                "human_feedback": None,
+                "next": "human_review",
+                "messages": [
+                    AIMessage(content=f"🔍 Human review requested: {reason}")
+                ],
+            }
+        elif tool_name == "finish":
+            return {"status": "complete", "next": "__end__"}
+
+    # No valid tool call — fall back to deterministic routing
+    logger.warning("supervisor: no valid tool call in LLM response, using fallback")
+    return _fallback_route(state)
+
+
+def _fallback_route(state: ResearchState) -> dict[str, Any]:
+    """Deterministic fallback routing when LLM doesn't provide a tool call.
+
+    Follows the natural pipeline order based on what data is available.
+    """
+    iteration = state.get("iteration", 0)
+
+    has_results = bool(state.get("search_results"))
+    has_content = bool(state.get("scraped_content"))
+    has_analysis = state.get("analysis") is not None
+    has_report = bool(state.get("report"))
+
+    if has_report:
+        return {"status": "complete", "next": "__end__"}
+
+    if has_analysis:
+        analysis = AnalysisResult.from_dict(state["analysis"])  # type: ignore[arg-type]
+        # Check if human review is needed and hasn't been addressed
+        if analysis.needs_human_review and state.get("human_feedback") is None:
+            return {
+                "status": "awaiting_human",
+                "next": "human_review",
+                "messages": [
+                    AIMessage(
+                        content=f"🔍 Human review requested: {analysis.review_reason}"
+                    )
+                ],
+            }
+        return {"status": "writing", "next": "writer"}
+
+    if has_content:
+        return {"status": "analysing", "next": "analyst"}
+
+    if has_results:
+        return {"status": "reading", "next": "content_reader"}
+
+    # Nothing done yet — plan and search
+    return {
+        "search_queries": [state.get("query", "")],
+        "status": "searching",
+        "iteration": iteration + 1,
+        "next": "web_searcher",
+    }
+
+
+def route_supervisor(state: ResearchState) -> NextNode | list[Send]:
+    """Conditional edge function: route from supervisor to the next node.
+
+    Called by LangGraph's conditional_edges to determine where to go
+    after the supervisor. Reads the ``next`` field set by :func:`supervisor`.
+
+    If the next step is ``web_searcher`` and multiple search queries exist,
+    this function returns a list of :class:`Send` objects for parallel
+    fan-out (one search worker per query batch).
+
+    Args:
+        state: The shared research state (after supervisor update).
+
+    Returns:
+        Either a node name string or a list of Send objects.
+    """
+    next_node: str = state.get("next", "__end__")  # type: ignore[assignment]
+
+    if next_node == "web_searcher":
+        # Fan-out: send the full search_queries list to the web_searcher.
+        # We keep it as a single Send (rather than per-query) because
+        # the web_searcher handles batching internally and Tavily calls
+        # are fast enough to not need parallelism.
+        return "web_searcher"
+
+    return next_node  # type: ignore[return-value]
