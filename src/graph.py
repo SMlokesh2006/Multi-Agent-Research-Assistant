@@ -21,6 +21,7 @@ from src.agents.critic import critic
 from src.agents.supervisor_fixed import supervisor
 from src.agents.web_searcher import web_searcher
 from src.agents.writer import writer
+from src.agents.human_review import human_review
 from src.state import ResearchState, create_initial_state
 
 logger = logging.getLogger(__name__)
@@ -33,13 +34,17 @@ CONTENT_READER = "content_reader"
 ANALYST = "analyst"
 CRITIC = "critic"
 WRITER = "writer"
+HUMAN_REVIEW = "human_review"
 
 
 # ── Routing logic ────────────────────────────────────────────
 
 
 def route_after_supervisor(state: ResearchState) -> str | list[Send]:
-    """Route from the initial planner to the web searchers."""
+    """Route from the initial planner to the web searchers or human review."""
+    if state.get("needs_clarification"):
+        return HUMAN_REVIEW
+        
     queries = state.get("search_queries", [])
     if len(queries) > 1:
         return [Send(WEB_SEARCHER, {"query": q}) for q in queries]
@@ -85,6 +90,7 @@ def create_graph(
     builder.add_node(ANALYST, analyst)
     builder.add_node(CRITIC, critic)
     builder.add_node(WRITER, writer)
+    builder.add_node(HUMAN_REVIEW, human_review)
 
     # ── Entry point ──────────────────────────────────────────
     builder.add_edge(START, SUPERVISOR)
@@ -93,8 +99,11 @@ def create_graph(
     builder.add_conditional_edges(
         SUPERVISOR,
         route_after_supervisor,
-        {WEB_SEARCHER: WEB_SEARCHER}
+        {WEB_SEARCHER: WEB_SEARCHER, HUMAN_REVIEW: HUMAN_REVIEW}
     )
+    
+    # After human review, go back to supervisor to replan
+    builder.add_edge(HUMAN_REVIEW, SUPERVISOR)
     
     # After search fan-out finishes, read content
     builder.add_edge(WEB_SEARCHER, CONTENT_READER)
@@ -120,8 +129,7 @@ def create_graph(
     builder.add_edge(WRITER, END)
 
     # ── Compile ──────────────────────────────────────────────
-    # We removed HUMAN_REVIEW, so no interrupt_before is needed for now.
-    graph = builder.compile(checkpointer=checkpointer)
+    graph = builder.compile(checkpointer=checkpointer, interrupt_before=[HUMAN_REVIEW])
 
     logger.info("Research graph compiled (checkpointer=%s)", type(checkpointer).__name__)
     return graph

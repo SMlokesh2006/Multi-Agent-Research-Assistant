@@ -33,8 +33,8 @@ Key Findings:
 Conflicting Views:
 {conflicts_text}
 
-Knowledge Gaps:
-{gaps_text}
+Limitations Log:
+{limitations_text}
 --- END ANALYSIS ---
 
 --- SOURCES ---
@@ -47,11 +47,12 @@ Write the report with EXACTLY these sections:
 
 ## Executive Summary
 A 2-3 paragraph overview of the key findings and conclusions.
+CRITICAL RULE: The very first sentence of the Executive Summary MUST contain a specific number, metric, or highly concrete fact from the research.
 
 ## Key Findings
-Detailed discussion of each finding. Use inline citations like [1], [2]
-referring to the numbered sources list. Each finding should be a
-subsection (### heading) with supporting evidence.
+Detailed discussion of each finding.
+CRITICAL RULE: Every single analytical claim MUST be tied to a source citation inline like [1], [2] referring to the numbered sources list.
+Each finding should be a subsection (### heading) with supporting evidence.
 
 ## Detailed Analysis
 Deeper exploration of the topic, synthesising information across sources.
@@ -61,8 +62,11 @@ Discussion of any contradictions or disagreements found across sources.
 If none, note that sources were largely consistent.
 
 ## Limitations & Gaps
-What the research could not fully answer, and suggestions for further
-investigation.
+Format this section using exactly these two sub-categories based on the provided Limitations Log:
+### Searched but Not Found
+List gaps that were searched for but no sources contained the information.
+### Not Attempted
+List gaps that genuinely require primary research or were out of scope.
 
 ## Sources
 Numbered list of all sources used:
@@ -70,8 +74,10 @@ Numbered list of all sources used:
 [2] Title — URL
 ...
 
-Guidelines:
+Guidelines & Constraints:
 - Be factual, precise, and well-structured.
+- ENFORCE "SHOW DON'T TELL": Instead of saying "results were remarkable" or "there was a significant impact", state EXACTLY what the results or impacts were.
+- BANNED PHRASES: Do NOT use generic filler phrases such as "represents a complex, multi-systemic challenge", "is characterized by a tension between", "sheds light on", "delves into", or "is a multifaceted issue". Use direct, concrete language.
 - Use inline citations [N] throughout the text.
 - Highlight data, statistics, and direct quotes where available.
 - Keep the tone professional but accessible.
@@ -171,18 +177,28 @@ async def writer(state: ResearchState) -> dict[str, Any]:
         if analysis.conflicts
         else "No significant conflicts detected."
     )
-    gaps_text = (
-        "\n".join(f"- {g}" for g in analysis.knowledge_gaps)
-        if analysis.knowledge_gaps
-        else "No major knowledge gaps identified."
-    )
+    limitations_log = state.get("limitations_log", [])
+    limitations_parts = []
+    if limitations_log:
+        for lim in limitations_log:
+            category = lim.get("category", "unknown")
+            gap = lim.get("gap", "")
+            limitations_parts.append(f"- [{category}] {gap}")
+        limitations_text = "\n".join(limitations_parts)
+    else:
+        # Fallback to older gaps list if limitations log is empty
+        limitations_text = (
+            "\n".join(f"- [not_attempted] {g}" for g in analysis.knowledge_gaps)
+            if analysis.knowledge_gaps
+            else "No major knowledge gaps identified."
+        )
     sources_text = _format_sources(pages)
 
     prompt = _REPORT_PROMPT.format(
         query=query,
         findings_text=findings_text,
         conflicts_text=conflicts_text,
-        gaps_text=gaps_text,
+        limitations_text=limitations_text,
         sources_text=sources_text,
     )
 

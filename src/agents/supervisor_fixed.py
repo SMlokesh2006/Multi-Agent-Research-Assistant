@@ -32,8 +32,8 @@ def _build_llm() -> ChatGoogleGenerativeAI:
     )
 
 
-async def plan_research(query: str) -> list[str]:
-    """Decompose a research question into 2-4 focused search queries."""
+async def plan_research(query: str) -> dict[str, Any]:
+    """Decompose a research question or detect ambiguity."""
     llm = _build_llm()
     limiter = get_rate_limiter(rpm=settings.gemini.rpm_limit)
     cache = get_cache(
@@ -50,12 +50,18 @@ async def plan_research(query: str) -> list[str]:
         return cached  # type: ignore[return-value]
 
     prompt = (
-        f"You are a research planner. Given the following research question, "
-        f"generate 2-4 diverse, specific search queries that together would "
-        f"comprehensively investigate the topic. Return ONLY a JSON array of "
-        f"strings, no other text.\n\n"
+        f"You are a research planner. Evaluate the following user research query.\n"
+        f"If the query is highly ambiguous (e.g., 'jaguar' could mean the animal, the car, or the OS) "
+        f"and you cannot confidently guess the user's intent, you must ask for clarification.\n"
+        f"Otherwise, generate 2-4 diverse, specific search queries that together would comprehensively investigate the topic.\n\n"
+        f"Return ONLY a JSON object with EXACTLY this structure, with no markdown fences:\n"
+        f"{{\n"
+        f"  \"needs_clarification\": true or false,\n"
+        f"  \"clarification_question\": \"Ask the user what they meant, if needs_clarification is true. Otherwise empty.\",\n"
+        f"  \"queries\": [\"query 1\", \"query 2\"] // if needs_clarification is false\n"
+        f"}}\n\n"
         f"Research question: {query}\n\n"
-        f"JSON array of search queries:"
+        f"JSON output:"
     )
 
     async def _invoke():
@@ -75,21 +81,32 @@ async def plan_research(query: str) -> list[str]:
                     text = text[4:]
         text = text.strip()
 
-        queries = json.loads(text)
-        if not isinstance(queries, list) or not queries:
-            queries = [query]
+        parsed = json.loads(text)
+        if not isinstance(parsed, dict):
+            parsed = {"needs_clarification": False, "clarification_question": "", "queries": [query]}
     except Exception as exc:
         logger.error(f"plan_research: failed to parse or generate queries: {exc}")
-        queries = [query]
+        parsed = {"needs_clarification": False, "clarification_question": "", "queries": [query]}
 
-    # Ensure we have 1-4 valid strings
-    queries = [str(q).strip() for q in queries if q][:4]
-    if not queries:
-        queries = [query]
+    needs_clarification = parsed.get("needs_clarification", False)
+    clarification_question = parsed.get("clarification_question", "")
+    queries = parsed.get("queries", [])
+    
+    if not needs_clarification:
+        # Ensure we have 1-4 valid strings
+        queries = [str(q).strip() for q in queries if q][:4]
+        if not queries:
+            queries = [query]
+            
+    result = {
+        "needs_clarification": needs_clarification,
+        "clarification_question": clarification_question,
+        "queries": queries,
+    }
 
-    await cache.set("llm", cache_key, queries)
-    logger.info(f"plan_research: generated {len(queries)} queries: {queries}")
-    return queries
+    await cache.set("llm", cache_key, result)
+    logger.info(f"plan_research: result: {result}")
+    return result
 
 
 async def supervisor(state: ResearchState) -> dict[str, Any]:
@@ -100,9 +117,20 @@ async def supervisor(state: ResearchState) -> dict[str, Any]:
     # Initial planning phase
     if iteration == 0:
         logger.info("supervisor: planning initial research queries")
-        search_queries = await plan_research(query)
+        plan_result = await plan_research(query)
+        
+        if plan_result.get("needs_clarification"):
+            return {
+                "needs_clarification": True,
+                "clarification_question": plan_result["clarification_question"],
+                "status": "awaiting_human_review",
+                "next": "human_review",
+            }
+            
         return {
-            "search_queries": search_queries,
+            "search_queries": plan_result["queries"],
+            "needs_clarification": False,
+            "clarification_question": "",
             "status": "searching",
             "iteration": 1,
             "next": "web_searcher",

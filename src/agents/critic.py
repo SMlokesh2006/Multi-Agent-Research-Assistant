@@ -41,14 +41,26 @@ Knowledge Gaps (identified by analyst):
 {gaps}
 --- END ANALYSIS ---
 
+--- PAST SEARCH QUERIES ---
+The following search queries were attempted in previous iterations:
+{past_queries}
+--- END PAST SEARCH QUERIES ---
+
 Evaluate the analysis. If the analysis comprehensively covers the query with no major gaps, set "status" to "SUFFICIENT".
 If there are gaps, provide 1-3 highly specific follow-up search queries to fill those gaps.
+
+For the limitations section of the final report, categorize each identified gap into one of two categories:
+- "searched_but_not_found": If a query related to this gap was already attempted (check the PAST SEARCH QUERIES) but the information is still missing.
+- "not_attempted": If it's a gap that requires primary research or has not been searched for yet.
 
 Return a JSON object with EXACTLY this structure (no markdown fences):
 {{
   "critique": "A brief explanation of what is missing or weak in the current analysis.",
   "status": "GAPS_FOUND or SUFFICIENT",
-  "follow_up_queries": ["query 1", "query 2"]
+  "follow_up_queries": ["query 1", "query 2"],
+  "limitations": [
+    {{"gap": "Description of the missing information", "category": "searched_but_not_found or not_attempted"}}
+  ]
 }}
 
 JSON output:"""
@@ -98,11 +110,14 @@ async def critic(state: ResearchState) -> dict[str, Any]:
     conflicts_text = "\n".join(f"- {c}" for c in analysis.conflicts)
     gaps_text = "\n".join(f"- {g}" for g in analysis.knowledge_gaps)
 
+    past_queries_text = "\n".join(f"- {q}" for q in state.get("search_queries", []))
+
     prompt = _CRITIC_PROMPT.format(
         query=query,
         findings=findings_text or "None",
         conflicts=conflicts_text or "None",
         gaps=gaps_text or "None",
+        past_queries=past_queries_text or "None",
     )
 
     llm = _build_llm()
@@ -129,6 +144,7 @@ async def critic(state: ResearchState) -> dict[str, Any]:
     critique_text = parsed.get("critique", "")
     status = parsed.get("status", "SUFFICIENT")
     queries = parsed.get("follow_up_queries", [])
+    limitations = parsed.get("limitations", [])
 
     logger.info(f"critic: status={status}, critique={critique_text[:60]}")
 
@@ -138,6 +154,7 @@ async def critic(state: ResearchState) -> dict[str, Any]:
             "status": "critic_complete",
             "next": "writer",
             "iteration": iteration + 1,
+            "limitations_log": limitations,
         }
     else:
         return {
@@ -146,4 +163,5 @@ async def critic(state: ResearchState) -> dict[str, Any]:
             "status": "critic_complete",
             "next": "web_searcher",
             "iteration": iteration + 1,
+            "limitations_log": limitations,
         }

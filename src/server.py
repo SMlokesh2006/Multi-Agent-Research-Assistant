@@ -178,11 +178,13 @@ async def _run_research_background(
             analysis = state_values.get("analysis") or {}
             messages = state_values.get("messages", [])
             
-            reason = "The research agents need your input to proceed."
-            if messages and hasattr(messages[-1], "content"):
-                msg_content = messages[-1].content
-                if isinstance(msg_content, str) and "Human review requested:" in msg_content:
-                    reason = msg_content.split("Human review requested:")[-1].strip()
+            reason = state_values.get("clarification_question")
+            if not reason:
+                reason = "The research agents need your input to proceed."
+                if messages and hasattr(messages[-1], "content"):
+                    msg_content = messages[-1].content
+                    if isinstance(msg_content, str) and "Human review requested:" in msg_content:
+                        reason = msg_content.split("Human review requested:")[-1].strip()
 
             hitl_payload = {
                 "type": "human_review",
@@ -342,6 +344,7 @@ def _map_node_to_sse_event(node_name: str, output: dict) -> dict[str, Any]:
         "analyst": "Analyzer",
         "critic": "Critic",
         "writer": "Writer",
+        "human_review": "Reviewer",
     }
 
     event_map: dict[str, str] = {
