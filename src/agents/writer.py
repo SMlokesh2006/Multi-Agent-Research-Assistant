@@ -14,6 +14,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 from src.config import settings
 from src.state import AnalysisResult, PageContent, ResearchState
+from src.utils import extract_text_content
 from src.utils.cache import get_cache
 from src.utils.rate_limiter import get_rate_limiter
 
@@ -106,8 +107,7 @@ def _format_findings(analysis: AnalysisResult, pages: list[PageContent]) -> str:
 def _format_sources(pages: list[PageContent]) -> str:
     """Format the numbered source list for the prompt."""
     return "\n".join(
-        f"[{i}] {p.title} — {p.url}\n    Summary: {p.summary[:300]}"
-        for i, p in enumerate(pages, 1)
+        f"[{i}] {p.title} — {p.url}\n    Summary: {p.summary[:300]}" for i, p in enumerate(pages, 1)
     )
 
 
@@ -194,7 +194,7 @@ async def writer(state: ResearchState) -> dict[str, Any]:
 
         async def _invoke():
             response = await llm.ainvoke(prompt)
-            return response.content
+            return extract_text_content(response.content)
 
         report = await limiter.execute_with_retry(_invoke)
 
@@ -230,8 +230,7 @@ def _build_fallback_report(
     sections: list[str] = [f"# Research Report: {query}\n"]
     sections.append("## Executive Summary\n")
     sections.append(
-        "*Report generation encountered an error. "
-        "Below is a summary of the raw analysis.*\n"
+        "*Report generation encountered an error. Below is a summary of the raw analysis.*\n"
     )
 
     sections.append("## Key Findings\n")

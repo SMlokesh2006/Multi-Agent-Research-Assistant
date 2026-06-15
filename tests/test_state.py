@@ -4,7 +4,6 @@ from src.state import (
     AnalysisResult,
     Finding,
     PageContent,
-    ResearchState,
     SearchResult,
     create_initial_state,
 )

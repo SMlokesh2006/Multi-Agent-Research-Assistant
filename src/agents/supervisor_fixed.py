@@ -4,11 +4,6 @@ This is the central routing node. It uses Gemini Flash with tool-calling
 to decide which sub-agent to invoke next, decomposes research questions
 into search sub-queries, tracks iteration counts, and triggers
 human-in-the-loop reviews when the analyst flags ambiguity.
-
-The supervisor operates in a loop:
-    1. First call → decompose query into search sub-queries → fan-out via Send.
-    2. Subsequent calls → inspect current state and route to the next agent.
-    3. Terminal call → return ``finish`` or ``request_human_input``.
 """
 
 from __future__ import annotations
@@ -131,7 +126,7 @@ _SUPERVISOR_TOOLS = [
     },
 ]
 
-_SUPERVISOR_SYSTEM = """\
+_SUPERVISOR_SYSTEM = """
 You are the Supervisor of a multi-agent research team. Your role is to
 coordinate the research pipeline by deciding which action to take next.
 
@@ -209,17 +204,7 @@ def _build_state_summary(state: ResearchState) -> str:
 
 
 async def plan_research(query: str) -> list[str]:
-    """Decompose a research question into 2-4 focused search queries.
-
-    Uses Gemini Flash to generate diverse, specific search queries that
-    together cover the research question comprehensively.
-
-    Args:
-        query: The user's research question.
-
-    Returns:
-        List of 2-4 search query strings.
-    """
+    """Decompose a research question into 2-4 focused search queries."""
     llm = _build_llm()
     limiter = get_rate_limiter(rpm=settings.gemini.rpm_limit)
     cache = get_cache(
@@ -240,8 +225,8 @@ async def plan_research(query: str) -> list[str]:
         f"You are a research planner. Given the following research question, "
         f"generate 2-4 diverse, specific search queries that together would "
         f"comprehensively investigate the topic. Return ONLY a JSON array of "
-        f"strings, no other text.\n\n"
-        f"Research question: {query}\n\n"
+        f"strings, no other text.\n\n"  # Added \n\n here
+        f"Research question: {query}\n\n"  # Added \n\n here
         f"JSON array of search queries:"
     )
 
@@ -296,23 +281,8 @@ NextNode = Literal[
 
 
 async def supervisor(state: ResearchState) -> dict[str, Any]:
-    """Decide and route to the next step in the research pipeline.
-
-    This function is called repeatedly by LangGraph. On each invocation it
-    inspects the current state, calls Gemini to decide the next action,
-    and returns a state update that the graph's conditional edges can use
-    for routing.
-
-    Returns a partial state update. The ``next`` field is consumed by
-    the graph's routing logic (not part of ResearchState itself — it's
-    typically read via a Command or conditional edge function).
-
-    Args:
-        state: The shared research state.
-
-    Returns:
-        Partial state update with routing metadata.
-    """
+    """Decide and route to the next step in the research pipeline."""
+    logger.debug(f"DEBUG: supervisor called with state type: {type(state)}")
     query = state.get("query", "")
     status = state.get("status", "initialized")
     iteration = state.get("iteration", 0)
@@ -337,7 +307,6 @@ async def supervisor(state: ResearchState) -> dict[str, Any]:
             return {"status": "complete", "next": "__end__"}
         if state.get("analysis"):
             return {"status": "writing", "next": "writer"}
-        # Force finish if we have nothing
         return {
             "status": "complete",
             "next": "__end__",
@@ -352,24 +321,20 @@ async def supervisor(state: ResearchState) -> dict[str, Any]:
     messages = [
         SystemMessage(content=_SUPERVISOR_SYSTEM),
         HumanMessage(
-            content=f"Current pipeline state:\n{state_summary}\n\nDecide the next action."
+            content=f"""Current pipeline state:
+{state_summary}
+
+Decide the next action."""
         ),
     ]
 
     try:
-
         async def _invoke():
-            return await llm.ainvoke(
-                messages,
-                tools=_SUPERVISOR_TOOLS,
-            )
-
+            return await llm.ainvoke(messages, tools=_SUPERVISOR_TOOLS)
         response = await limiter.execute_with_retry(_invoke)
-
     except Exception as exc:
         error_msg = f"supervisor: LLM routing failed: {exc}"
         logger.error(error_msg)
-        # Deterministic fallback based on state
         return _fallback_route(state)
 
     # ── Parse tool call from response ────────────────────────
@@ -377,13 +342,10 @@ async def supervisor(state: ResearchState) -> dict[str, Any]:
 
 
 def _parse_tool_call(response: Any, state: ResearchState) -> dict[str, Any]:
-    """Extract the supervisor's routing decision from the LLM response.
-
-    Handles both tool_calls on the response and plain-text fallback.
-    """
+    """Extract the supervisor's routing decision from the LLM response."""
+    logger.debug(f"DEBUG: _parse_tool_call called with state type: {type(state)}")
     iteration = state.get("iteration", 0)
 
-    # Check for tool calls
     if hasattr(response, "tool_calls") and response.tool_calls:
         tool_call = response.tool_calls[0]
         tool_name = tool_call.get("name", "")
@@ -393,6 +355,9 @@ def _parse_tool_call(response: Any, state: ResearchState) -> dict[str, Any]:
 
         if tool_name == "search":
             queries = tool_args.get("queries", [])
+            if not queries:
+                logger.warning("supervisor: LLM returned empty search queries, using fallback")
+                queries = [state.get("query", "")]
             return {
                 "search_queries": queries,
                 "status": "searching",
@@ -416,16 +381,13 @@ def _parse_tool_call(response: Any, state: ResearchState) -> dict[str, Any]:
         elif tool_name == "finish":
             return {"status": "complete", "next": "__end__"}
 
-    # No valid tool call — fall back to deterministic routing
     logger.warning("supervisor: no valid tool call in LLM response, using fallback")
     return _fallback_route(state)
 
 
 def _fallback_route(state: ResearchState) -> dict[str, Any]:
-    """Deterministic fallback routing when LLM doesn't provide a tool call.
-
-    Follows the natural pipeline order based on what data is available.
-    """
+    """Deterministic fallback routing when LLM doesn't provide a tool call."""
+    logger.debug(f"DEBUG: _fallback_route called with state type: {type(state)}")
     iteration = state.get("iteration", 0)
 
     has_results = bool(state.get("search_results"))
@@ -437,15 +399,12 @@ def _fallback_route(state: ResearchState) -> dict[str, Any]:
         return {"status": "complete", "next": "__end__"}
 
     if has_analysis:
-        analysis = AnalysisResult.from_dict(state["analysis"])  # type: ignore[arg-type]
-        # Check if human review is needed and hasn't been addressed
+        analysis = AnalysisResult.from_dict(state["analysis"])
         if analysis.needs_human_review and state.get("human_feedback") is None:
             return {
                 "status": "awaiting_human",
                 "next": "human_review",
-                "messages": [
-                    AIMessage(content=f"🔍 Human review requested: {analysis.review_reason}")
-                ],
+                "messages": [AIMessage(content=f"🔍 Human review requested: {analysis.review_reason}")],
             }
         return {"status": "writing", "next": "writer"}
 
@@ -455,7 +414,6 @@ def _fallback_route(state: ResearchState) -> dict[str, Any]:
     if has_results:
         return {"status": "reading", "next": "content_reader"}
 
-    # Nothing done yet — plan and search
     return {
         "search_queries": [state.get("query", "")],
         "status": "searching",
@@ -465,22 +423,8 @@ def _fallback_route(state: ResearchState) -> dict[str, Any]:
 
 
 def route_supervisor(state: ResearchState) -> NextNode | list[Send]:
-    """Conditional edge function: route from supervisor to the next node.
-
-    Called by LangGraph's conditional_edges to determine where to go
-    after the supervisor. Reads the ``next`` field set by :func:`supervisor`.
-
-    If the next step is ``web_searcher`` and multiple search queries exist,
-    this function returns a list of :class:`Send` objects for parallel
-    fan-out (one search worker per query).
-
-    Args:
-        state: The shared research state (after supervisor update).
-
-    Returns:
-        Either a node name string or a list of Send objects.
-    """
-    next_node: str = state.get("next", "__end__")  # type: ignore[assignment]
+    """Conditional edge function: route from supervisor to the next node."""
+    next_node: str = state.get("next", "__end__")
 
     if next_node == "web_searcher":
         queries = state.get("search_queries", [])
@@ -489,4 +433,4 @@ def route_supervisor(state: ResearchState) -> NextNode | list[Send]:
             return [Send("web_searcher", {"query": q}) for q in queries]
         return "web_searcher"
 
-    return next_node  # type: ignore[return-value]
+    return next_node

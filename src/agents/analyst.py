@@ -17,6 +17,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 from src.config import settings
 from src.state import AnalysisResult, Finding, PageContent, ResearchState
+from src.utils import extract_text_content
 from src.utils.cache import get_cache
 from src.utils.rate_limiter import get_rate_limiter
 
@@ -79,10 +80,7 @@ def _format_pages(pages: list[PageContent]) -> str:
     parts: list[str] = []
     for i, page in enumerate(pages, 1):
         parts.append(
-            f"[Source {i}]\n"
-            f"Title: {page.title}\n"
-            f"URL: {page.url}\n"
-            f"Summary:\n{page.summary}\n"
+            f"[Source {i}]\nTitle: {page.title}\nURL: {page.url}\nSummary:\n{page.summary}\n"
         )
     return "\n---\n".join(parts)
 
@@ -120,20 +118,14 @@ def _determine_needs_review(analysis: AnalysisResult) -> tuple[bool, str]:
     reasons: list[str] = []
 
     if len(analysis.conflicts) >= 2:
-        reasons.append(
-            f"{len(analysis.conflicts)} conflicting claims detected across sources"
-        )
+        reasons.append(f"{len(analysis.conflicts)} conflicting claims detected across sources")
 
     low_confidence = [f for f in analysis.key_findings if f.confidence < 0.5]
     if low_confidence:
-        reasons.append(
-            f"{len(low_confidence)} findings have low confidence (< 0.5)"
-        )
+        reasons.append(f"{len(low_confidence)} findings have low confidence (< 0.5)")
 
     if len(analysis.knowledge_gaps) >= 3:
-        reasons.append(
-            f"{len(analysis.knowledge_gaps)} significant knowledge gaps identified"
-        )
+        reasons.append(f"{len(analysis.knowledge_gaps)} significant knowledge gaps identified")
 
     if reasons:
         return True, "; ".join(reasons)
@@ -204,7 +196,7 @@ async def analyst(state: ResearchState) -> dict[str, Any]:
 
         async def _invoke():
             response = await llm.ainvoke(prompt)
-            return response.content
+            return extract_text_content(response.content)
 
         raw_response = await limiter.execute_with_retry(_invoke)
         parsed = _parse_analysis_json(raw_response)

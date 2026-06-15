@@ -22,8 +22,8 @@ from langgraph.types import Send, interrupt
 
 from src.agents.analyst import analyst
 from src.agents.content_reader import content_reader
-from src.agents.supervisor import supervisor
-from src.agents.supervisor import route_supervisor as _supervisor_route
+from src.agents.supervisor_fixed import supervisor
+from src.agents.supervisor_fixed import route_supervisor as _supervisor_route
 from src.agents.web_searcher import web_searcher
 from src.agents.writer import writer
 from src.state import ResearchState, create_initial_state
@@ -53,7 +53,15 @@ async def human_review(state: ResearchState) -> dict:
     When resumed via ``Command(resume=feedback)``, it reads the
     feedback and passes it along to the supervisor for incorporation.
     """
-    feedback = interrupt("Awaiting human review feedback")
+    # The interrupt() call will pause the graph. When resumed, the value
+    # passed to resume will be returned by this call.
+    feedback_command = interrupt("Awaiting human review feedback")
+
+    # If feedback is a string (from resume), update the state
+    if isinstance(feedback_command, str):
+        feedback = feedback_command
+    else:
+        feedback = None  # Or handle other types as needed
 
     logger.info("Human review received feedback: %s", feedback[:100] if feedback else "None")
 

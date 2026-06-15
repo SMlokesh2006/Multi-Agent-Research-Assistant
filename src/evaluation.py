@@ -22,9 +22,9 @@ import logging
 import os
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any
 
 from src.config import settings
+from src.utils import extract_text_content
 
 logger = logging.getLogger(__name__)
 
@@ -184,10 +184,8 @@ async def _evaluate_criterion(
     rate_limiter = get_rate_limiter()
 
     try:
-        response = await rate_limiter.execute_with_retry(
-            llm.ainvoke, prompt
-        )
-        content = response.content.strip()
+        response = await rate_limiter.execute_with_retry(llm.ainvoke, prompt)
+        content = extract_text_content(response.content).strip()
 
         # Parse JSON response — handle markdown fences
         if content.startswith("```"):
@@ -315,9 +313,7 @@ async def run_evaluation(
 
         except Exception as e:
             logger.exception("Evaluation failed for query %d", i)
-            results.append(
-                EvaluationResult(query=query, report="", error=str(e))
-            )
+            results.append(EvaluationResult(query=query, report="", error=str(e)))
 
     return results
 
@@ -346,8 +342,13 @@ def print_evaluation_summary(results: list[EvaluationResult]) -> None:
     for r in results:
         if r.error:
             table.add_row(
-                r.query[:40], "ERR", "ERR", "ERR", "ERR",
-                "[red]Error[/red]", "-",
+                r.query[:40],
+                "ERR",
+                "ERR",
+                "ERR",
+                "ERR",
+                "[red]Error[/red]",
+                "-",
             )
             continue
 
@@ -393,12 +394,8 @@ def main() -> None:
         return
 
     parser = argparse.ArgumentParser(description="Run research evaluation suite")
-    parser.add_argument(
-        "--queries", nargs="+", help="Custom test queries (default: built-in set)"
-    )
-    parser.add_argument(
-        "--iterations", "-n", type=int, default=3, help="Max iterations per query"
-    )
+    parser.add_argument("--queries", nargs="+", help="Custom test queries (default: built-in set)")
+    parser.add_argument("--iterations", "-n", type=int, default=3, help="Max iterations per query")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
     args = parser.parse_args()
@@ -414,9 +411,7 @@ def main() -> None:
         os.environ.setdefault("LANGSMITH_PROJECT", "research-assistant-eval")
         logger.info("LangSmith tracing enabled for evaluation")
 
-    results = asyncio.run(
-        run_evaluation(queries=args.queries, max_iterations=args.iterations)
-    )
+    results = asyncio.run(run_evaluation(queries=args.queries, max_iterations=args.iterations))
     print_evaluation_summary(results)
 
     # Optionally save results to file

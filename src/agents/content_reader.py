@@ -18,6 +18,7 @@ from tavily import AsyncTavilyClient
 
 from src.config import settings
 from src.state import PageContent, ResearchState, SearchResult
+from src.utils import extract_text_content
 from src.utils.cache import get_cache
 from src.utils.rate_limiter import get_rate_limiter
 
@@ -46,9 +47,7 @@ Provide a clear, information-dense summary:"""
 def _build_tavily_client() -> AsyncTavilyClient:
     """Create a Tavily async client from settings."""
     if not settings.tavily.api_key:
-        raise ValueError(
-            "TAVILY_API_KEY not set. Copy .env.example to .env and add your key."
-        )
+        raise ValueError("TAVILY_API_KEY not set. Copy .env.example to .env and add your key.")
     return AsyncTavilyClient(api_key=settings.tavily.api_key)
 
 
@@ -62,9 +61,7 @@ def _build_llm() -> ChatGoogleGenerativeAI:
     )
 
 
-async def _extract_with_tavily(
-    client: AsyncTavilyClient, urls: list[str]
-) -> dict[str, dict]:
+async def _extract_with_tavily(client: AsyncTavilyClient, urls: list[str]) -> dict[str, dict]:
     """Attempt to extract page content via Tavily Extract API.
 
     Args:
@@ -145,7 +142,7 @@ async def _summarise_content(
 
     async def _invoke():
         response = await llm.ainvoke(prompt)
-        return response.content
+        return extract_text_content(response.content)
 
     return await limiter.execute_with_retry(_invoke)
 
@@ -269,9 +266,7 @@ async def content_reader(state: ResearchState) -> dict[str, Any]:
         try:
             summary = await _summarise_content(llm, url, title, raw_content)
         except Exception as exc:
-            error_msg = (
-                f"content_reader: summarisation failed for {url[:80]}: {exc}"
-            )
+            error_msg = f"content_reader: summarisation failed for {url[:80]}: {exc}"
             logger.error(error_msg)
             errors.append(error_msg)
             # Use a truncated raw content snippet as a fallback summary
@@ -289,9 +284,7 @@ async def content_reader(state: ResearchState) -> dict[str, Any]:
         await cache.set("page", url, page_dict)
         pages.append(page_dict)
 
-    logger.info(
-        f"content_reader: returning {len(pages)} pages ({len(errors)} errors)"
-    )
+    logger.info(f"content_reader: returning {len(pages)} pages ({len(errors)} errors)")
 
     return {
         "scraped_content": pages,

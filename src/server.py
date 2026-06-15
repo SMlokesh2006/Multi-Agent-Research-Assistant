@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import uuid
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -41,9 +42,7 @@ class ResearchRequest(BaseModel):
     """Request body for starting a new research session."""
 
     query: str = Field(..., min_length=3, max_length=2000, description="The research question")
-    max_iterations: int = Field(
-        default=3, ge=1, le=10, description="Maximum research iterations"
-    )
+    max_iterations: int = Field(default=3, ge=1, le=10, description="Maximum research iterations")
 
 
 class FeedbackRequest(BaseModel):
@@ -81,7 +80,7 @@ class HealthResponse(BaseModel):
 # ── In-memory tracking of active research tasks ──────────────
 
 _active_tasks: dict[str, asyncio.Task] = {}
-_active_graphs: dict[str, Any] = {}
+_event_queues: dict[str, set[asyncio.Queue]] = defaultdict(set)
 
 
 # ── Lifespan ─────────────────────────────────────────────────
@@ -98,6 +97,9 @@ async def lifespan(app: FastAPI):
     # Cancel any running research tasks
     for task in _active_tasks.values():
         task.cancel()
+    from src.persistence import close_checkpointer
+
+    await close_checkpointer()
     logger.info("Server shutdown complete")
 
 
@@ -123,25 +125,46 @@ app.add_middleware(
 # ── Background research runner ───────────────────────────────
 
 
-async def _run_research_background(thread_id: str, query: str, max_iterations: int) -> None:
+async def _run_research_background(
+    thread_id: str,
+    query: str,
+    max_iterations: int,
+    initial_input: Any = None,
+) -> None:
     """Execute the research graph in the background.
 
-    Updates the session record as the research progresses.
+    Updates the session record and broadcasts updates to connected SSE clients.
     """
     session_mgr = get_session_manager()
     try:
         checkpointer = await get_checkpointer()
         graph = create_graph(checkpointer=checkpointer)
-        _active_graphs[thread_id] = graph
 
-        initial_state = create_initial_state(query, max_iterations=max_iterations)
         config = {"configurable": {"thread_id": thread_id}}
 
-        final_state = await graph.ainvoke(initial_state, config=config)
+        # If no initial_input, this is a fresh start
+        if initial_input is None:
+            initial_input = create_initial_state(query, max_iterations=max_iterations)
+
+        last_state = initial_input
+
+        # Stream graph updates and broadcast to queues
+        async for event in graph.astream(initial_input, config=config, stream_mode="updates"):
+            for node_name, node_output in event.items():
+                last_state = node_output
+                sse_event = _map_node_to_sse_event(node_name, node_output)
+                
+                # Broadcast to all listening queues
+                if thread_id in _event_queues:
+                    payload = {"type": sse_event["type"], "data": sse_event["data"]}
+                    for queue in _event_queues[thread_id]:
+                        await queue.put(payload)
 
         # Update session with final results
+        final_state = last_state if isinstance(last_state, dict) else {}
         report = final_state.get("report", "")
         status = final_state.get("status", "complete")
+        
         await session_mgr.save_session(
             thread_id=thread_id,
             query=query,
@@ -150,20 +173,28 @@ async def _run_research_background(thread_id: str, query: str, max_iterations: i
             metadata={"iteration": final_state.get("iteration", 0)},
         )
 
+        # Signal completion to queues
+        if thread_id in _event_queues:
+            for queue in _event_queues[thread_id]:
+                await queue.put({"type": "complete", "data": {"message": "Research complete"}})
+
     except asyncio.CancelledError:
         logger.info("Research task cancelled: %s", thread_id)
-        await session_mgr.save_session(
-            thread_id=thread_id, query=query, status="cancelled"
-        )
+        await session_mgr.save_session(thread_id=thread_id, query=query, status="cancelled")
     except Exception as e:
         logger.exception("Research task failed: %s", thread_id)
         await session_mgr.save_session(
-            thread_id=thread_id, query=query, status="error",
+            thread_id=thread_id,
+            query=query,
+            status="error",
             metadata={"error": str(e)},
         )
+        # Signal error to queues
+        if thread_id in _event_queues:
+            for queue in _event_queues[thread_id]:
+                await queue.put({"type": "error", "data": {"message": str(e)}})
     finally:
         _active_tasks.pop(thread_id, None)
-        _active_graphs.pop(thread_id, None)
 
 
 # ── Endpoints ────────────────────────────────────────────────
@@ -198,62 +229,41 @@ async def start_research(request: ResearchRequest) -> ResearchResponse:
 
 @app.get("/research/{thread_id}/stream")
 async def stream_research(thread_id: str):
-    """SSE endpoint streaming real-time graph updates.
-
-    Event types:
-    - ``status``        — pipeline stage change
-    - ``search_result`` — new search results found
-    - ``content``       — page content extracted
-    - ``analysis``      — analysis complete
-    - ``report``        — final report generated
-    - ``human_review``  — awaiting human input
-    - ``error``         — error occurred
-    - ``complete``      — research finished
-    """
+    """SSE endpoint streaming real-time graph updates via broadcast queues."""
 
     async def event_generator():
-        """Yield SSE events from the graph stream."""
+        queue = asyncio.Queue()
+        _event_queues[thread_id].add(queue)
+        
         try:
-            checkpointer = await get_checkpointer()
-            graph = create_graph(checkpointer=checkpointer)
-
-            # Check if session exists
+            # If the task is already finished, tell the client
             session_mgr = get_session_manager()
             session = await session_mgr.get_session(thread_id)
             if not session:
-                yield {
-                    "event": "error",
-                    "data": json.dumps({"error": "Session not found"}),
-                }
+                yield {"event": "message", "data": json.dumps({"type": "error", "data": {"message": "Session not found"}})}
                 return
 
-            config = {"configurable": {"thread_id": thread_id}}
+            if session.status in ["complete", "error", "cancelled"] and thread_id not in _active_tasks:
+                yield {"event": "message", "data": json.dumps({"type": "complete", "data": {"message": "Research already finished"}})}
+                return
 
-            # Stream graph updates
-            async for event in graph.astream(
-                None,  # Resume from checkpoint (state already initialized)
-                config=config,
-                stream_mode="updates",
-            ):
-                for node_name, node_output in event.items():
-                    sse_event = _map_node_to_sse_event(node_name, node_output)
-                    yield {
-                        "event": sse_event["type"],
-                        "data": json.dumps(sse_event["data"]),
-                    }
-
-            # Signal completion
-            yield {
-                "event": "complete",
-                "data": json.dumps({"message": "Research complete"}),
-            }
-
-        except Exception as e:
-            logger.exception("Stream error for thread %s", thread_id)
-            yield {
-                "event": "error",
-                "data": json.dumps({"error": str(e)}),
-            }
+            # Stream from the queue
+            while True:
+                try:
+                    # Wait for an event with a timeout to keep the connection alive
+                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    yield {"event": "message", "data": json.dumps(event)}
+                    
+                    if event["type"] in ["complete", "error"]:
+                        break
+                except asyncio.TimeoutError:
+                    # Heartbeat
+                    yield {"event": "ping", "data": ""}
+                
+        finally:
+            _event_queues[thread_id].remove(queue)
+            if not _event_queues[thread_id]:
+                del _event_queues[thread_id]
 
     return EventSourceResponse(event_generator())
 
@@ -304,40 +314,30 @@ def _map_node_to_sse_event(node_name: str, output: dict) -> dict[str, Any]:
 async def submit_feedback(thread_id: str, request: FeedbackRequest) -> dict:
     """Submit HITL feedback to resume a paused research session.
 
-    The graph must be in a ``human_review`` interrupt state for this
-    endpoint to work.
+    Resumes by launching a new background task with the feedback command.
     """
-    try:
-        checkpointer = await get_checkpointer()
-        graph = create_graph(checkpointer=checkpointer)
-        config = {"configurable": {"thread_id": thread_id}}
+    session_mgr = get_session_manager()
+    session = await session_mgr.get_session(thread_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
 
-        from langgraph.types import Command
+    if thread_id in _active_tasks:
+        raise HTTPException(status_code=400, detail="Research task is already running")
 
-        # Resume the graph with human feedback
-        result = await graph.ainvoke(
-            Command(resume=request.feedback),
-            config=config,
+    from langgraph.types import Command
+
+    # Launch background task with resume command
+    task = asyncio.create_task(
+        _run_research_background(
+            thread_id, 
+            session.query, 
+            3, # default iterations
+            initial_input=Command(resume=request.feedback)
         )
+    )
+    _active_tasks[thread_id] = task
 
-        # Update session
-        session_mgr = get_session_manager()
-        status = result.get("status", "in_progress") if isinstance(result, dict) else "in_progress"
-        report = result.get("report", "") if isinstance(result, dict) else ""
-        await session_mgr.save_session(
-            thread_id=thread_id,
-            query=(await session_mgr.get_session(thread_id)).query
-            if await session_mgr.get_session(thread_id)
-            else "",
-            status=status,
-            report=report,
-        )
-
-        return {"status": "feedback_submitted", "thread_id": thread_id}
-
-    except Exception as e:
-        logger.exception("Failed to submit feedback for thread %s", thread_id)
-        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "feedback_submitted", "thread_id": thread_id}
 
 
 @app.get("/research/{thread_id}/status", response_model=SessionStatusResponse)

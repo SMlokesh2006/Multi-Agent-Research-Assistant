@@ -12,23 +12,17 @@ load_dotenv()
 class GeminiConfig:
     """Configuration for the Gemini Flash LLM."""
 
-    model: str = field(
-        default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-    )
+    model: str = field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
     temperature: float = 0.3
     max_output_tokens: int = 8192
-    rpm_limit: int = field(
-        default_factory=lambda: int(os.getenv("GEMINI_RPM_LIMIT", "15"))
-    )
+    rpm_limit: int = field(default_factory=lambda: int(os.getenv("GEMINI_RPM_LIMIT", "15")))
 
 
 @dataclass(frozen=True)
 class TavilyConfig:
     """Configuration for the Tavily search API."""
 
-    api_key: str = field(
-        default_factory=lambda: os.getenv("TAVILY_API_KEY", "")
-    )
+    api_key: str = field(default_factory=lambda: os.getenv("TAVILY_API_KEY", ""))
     max_results: int = 5
     search_depth: str = "advanced"  # "basic" (1 credit) or "advanced" (2 credits)
     include_raw_content: bool = False
@@ -39,9 +33,7 @@ class CacheConfig:
     """Configuration for the response cache."""
 
     db_path: str = "cache.db"
-    search_ttl_hours: int = field(
-        default_factory=lambda: int(os.getenv("CACHE_TTL_HOURS", "24"))
-    )
+    search_ttl_hours: int = field(default_factory=lambda: int(os.getenv("CACHE_TTL_HOURS", "24")))
     page_ttl_hours: int = 168  # 7 days
     llm_ttl_hours: int = 72  # 3 days
 
@@ -77,9 +69,7 @@ class Settings:
     def google_api_key(self) -> str:
         key = os.getenv("GOOGLE_API_KEY", "")
         if not key:
-            raise ValueError(
-                "GOOGLE_API_KEY not set. Copy .env.example to .env and add your key."
-            )
+            raise ValueError("GOOGLE_API_KEY not set. Copy .env.example to .env and add your key.")
         return key
 
     @property

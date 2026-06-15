@@ -22,36 +22,35 @@ logger = logging.getLogger(__name__)
 def _build_tavily_client() -> AsyncTavilyClient:
     """Create a Tavily async client from settings."""
     if not settings.tavily.api_key:
-        raise ValueError(
-            "TAVILY_API_KEY not set. Copy .env.example to .env and add your key."
-        )
+        raise ValueError("TAVILY_API_KEY not set. Copy .env.example to .env and add your key.")
     return AsyncTavilyClient(api_key=settings.tavily.api_key)
 
 
-async def web_searcher(state: ResearchState) -> dict[str, Any]:
-    """Search the web for each query in ``state['search_queries']``.
+async def web_searcher(state: ResearchState | str | dict) -> dict[str, Any]:
+    """Search the web for one or more queries.
 
-    Workflow:
-        1. Check cache for each query — skip API call on hit.
-        2. Call Tavily search API for cache misses.
-        3. Deduplicate results by URL across all queries.
-        4. Return partial state update with ``search_results`` and ``status``.
+    This agent supports both sequential and parallel (fan-out) execution.
+    If called with a string, it searches that single query.
+    If called with ResearchState, it searches all ``state['search_queries']``.
 
     Args:
-        state: The shared research state.
+        state: ResearchState dict, or a single query string, or a dict
+               containing 'query'.
 
     Returns:
-        Partial state update dict with ``search_results``, ``status``,
-        and ``errors`` (if any failures occurred).
+        Partial state update dict with ``search_results``.
     """
-    queries: list[str] = state.get("search_queries", [])
+    # ── Parse input ──────────────────────────────────────────
+    if isinstance(state, str):
+        queries = [state]
+    elif isinstance(state, dict) and "query" in state and "search_queries" not in state:
+        queries = [state["query"]]
+    else:
+        queries = state.get("search_queries", [])
+
     if not queries:
         logger.warning("web_searcher called with no search_queries")
-        return {
-            "search_results": [],
-            "errors": ["web_searcher: no search queries provided"],
-            "status": "search_complete",
-        }
+        return {"search_results": []}
 
     logger.info(f"web_searcher: searching {len(queries)} queries")
 
@@ -67,9 +66,10 @@ async def web_searcher(state: ResearchState) -> dict[str, Any]:
     seen_urls: set[str] = set()
     errors: list[str] = []
 
-    # Collect already-seen URLs from prior results in state
-    for existing in state.get("search_results", []):
-        seen_urls.add(existing["url"])
+    # If we have the full state, we can avoid duplicates from prior search batches
+    if isinstance(state, dict):
+        for existing in state.get("search_results", []):
+            seen_urls.add(existing["url"])
 
     for query in queries:
         try:
@@ -108,10 +108,7 @@ async def web_searcher(state: ResearchState) -> dict[str, Any]:
             logger.error(error_msg)
             errors.append(error_msg)
 
-    logger.info(
-        f"web_searcher: returning {len(all_results)} unique results "
-        f"({len(errors)} errors)"
-    )
+    logger.info(f"web_searcher: returning {len(all_results)} unique results")
 
     return {
         "search_results": all_results,

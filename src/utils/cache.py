@@ -6,11 +6,11 @@ Critical for staying within free tier limits during development and demos.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import time
-from pathlib import Path
 
 import aiosqlite
 
@@ -40,28 +40,33 @@ class ResponseCache:
             "llm": llm_ttl_hours * 3600,
         }
         self._initialized = False
+        self._lock = asyncio.Lock()
 
     async def _ensure_initialized(self) -> None:
         """Create the cache table if it doesn't exist."""
         if self._initialized:
             return
 
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS cache (
-                    namespace TEXT NOT NULL,
-                    key TEXT NOT NULL,
-                    value TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    PRIMARY KEY (namespace, key)
-                )
-            """)
-            await db.execute("""
-                CREATE INDEX IF NOT EXISTS idx_cache_expiry
-                ON cache (namespace, created_at)
-            """)
-            await db.commit()
-        self._initialized = True
+        async with self._lock:
+            if self._initialized:
+                return
+
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS cache (
+                        namespace TEXT NOT NULL,
+                        key TEXT NOT NULL,
+                        value TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        PRIMARY KEY (namespace, key)
+                    )
+                """)
+                await db.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_cache_expiry
+                    ON cache (namespace, created_at)
+                """)
+                await db.commit()
+            self._initialized = True
 
     @staticmethod
     def _hash_key(key: str) -> str:
@@ -136,9 +141,7 @@ class ResponseCache:
 
         async with aiosqlite.connect(self.db_path) as db:
             if namespace:
-                cursor = await db.execute(
-                    "DELETE FROM cache WHERE namespace = ?", (namespace,)
-                )
+                cursor = await db.execute("DELETE FROM cache WHERE namespace = ?", (namespace,))
             else:
                 cursor = await db.execute("DELETE FROM cache")
             await db.commit()

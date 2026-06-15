@@ -11,7 +11,7 @@ import json
 import logging
 import time
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
+from typing import Any
 
 import aiosqlite
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 # ── Checkpoint saver ─────────────────────────────────────────
 
+_checkpointer_context: Any = None
 _checkpointer: AsyncSqliteSaver | None = None
 
 
@@ -35,13 +36,24 @@ async def get_checkpointer() -> AsyncSqliteSaver:
     Returns:
         An initialized ``AsyncSqliteSaver`` instance.
     """
-    global _checkpointer
+    global _checkpointer, _checkpointer_context
     if _checkpointer is None:
         db_path = settings.persistence.checkpoint_db
-        _checkpointer = AsyncSqliteSaver.from_conn_string(db_path)
+        _checkpointer_context = AsyncSqliteSaver.from_conn_string(db_path)
+        _checkpointer = await _checkpointer_context.__aenter__()
         await _checkpointer.setup()
         logger.info("Checkpoint saver initialized: %s", db_path)
     return _checkpointer
+
+
+async def close_checkpointer() -> None:
+    """Close the global checkpoint saver if it is open."""
+    global _checkpointer, _checkpointer_context
+    if _checkpointer_context is not None:
+        await _checkpointer_context.__aexit__(None, None, None)
+        _checkpointer_context = None
+        _checkpointer = None
+        logger.info("Checkpoint saver closed")
 
 
 # ── Session metadata ─────────────────────────────────────────

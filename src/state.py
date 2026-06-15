@@ -8,10 +8,18 @@ from __future__ import annotations
 
 import operator
 from dataclasses import dataclass, field
-from typing import Annotated, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
+
+
+# ── Reducers ─────────────────────────────────────────────────
+
+
+def take_latest(left: Any, right: Any) -> Any:
+    """Always take the newest value (right) over the old one (left)."""
+    return right
 
 
 # ── Data Models ──────────────────────────────────────────────
@@ -162,11 +170,11 @@ class ResearchState(TypedDict, total=False):
     # ── Conversation & control flow ──────────────────────────
     messages: Annotated[list[BaseMessage], add_messages]  # LLM conversation history
     human_feedback: str | None  # Input from HITL interrupt
-    status: str  # Current pipeline stage
+    status: Annotated[str, take_latest]  # Current pipeline stage
     errors: Annotated[list[str], operator.add]  # Error log for debugging
 
     # ── Routing (set by supervisor, read by graph edges) ────
-    next: str  # Next node to route to (consumed by conditional edges)
+    next: Annotated[str, take_latest]  # Next node to route to
 
     # ── Metadata ─────────────────────────────────────────────
     iteration: int  # Current research iteration (for loops)

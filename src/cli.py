@@ -19,13 +19,11 @@ import uuid
 from typing import Any
 
 from rich.console import Console
-from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Prompt
 from rich.table import Table
-from rich.text import Text
 
 from src.graph import HUMAN_REVIEW, create_graph
 from src.persistence import get_checkpointer, get_session_manager
@@ -159,9 +157,7 @@ async def run_cli(query: str, max_iterations: int = 3) -> None:
                 ):
                     for node_name, node_output in event.items():
                         status = node_output.get("status", "")
-                        progress.update(
-                            task, description=f"[cyan]{node_name}[/cyan] — {status}"
-                        )
+                        progress.update(task, description=f"[cyan]{node_name}[/cyan] — {status}")
 
                         # Display node-specific output
                         if node_name == "web_searcher" and "search_results" in node_output:
