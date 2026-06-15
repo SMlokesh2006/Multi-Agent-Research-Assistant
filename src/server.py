@@ -151,6 +151,9 @@ async def _run_research_background(
         # Stream graph updates and broadcast to queues
         async for event in graph.astream(initial_input, config=config, stream_mode="updates"):
             for node_name, node_output in event.items():
+                # Skip internal LangGraph events like __interrupt__
+                if node_name.startswith("__"):
+                    continue
                 last_state = node_output
                 sse_event = _map_node_to_sse_event(node_name, node_output)
                 
@@ -160,7 +163,46 @@ async def _run_research_background(
                     for queue in _event_queues[thread_id]:
                         await queue.put(payload)
 
-        # Update session with final results
+        # ── Check if graph paused for HITL interrupt ─────────
+        graph_state = await graph.aget_state(config)
+        is_interrupted = bool(graph_state.next)
+
+        if is_interrupted:
+            # Graph is paused at interrupt_before (human_review node).
+            # Send a human_review event so the frontend shows the HITL modal,
+            # then exit WITHOUT sending "complete".
+            logger.info("Research paused for human review: %s", thread_id)
+
+            # Build the HITL event payload from the current graph state
+            state_values = graph_state.values or {}
+            analysis = state_values.get("analysis") or {}
+            hitl_payload = {
+                "type": "human_review",
+                "data": {
+                    "node": "human_review",
+                    "agent": "Reviewer",
+                    "status": "awaiting_human_review",
+                    "message": "Awaiting Human Review",
+                    "reason": analysis.get("review_reason", "The research agents need your input to proceed."),
+                    "conflicts": analysis.get("conflicts", []),
+                    "findings": analysis.get("key_findings", []),
+                    "gaps": analysis.get("knowledge_gaps", []),
+                },
+            }
+            if thread_id in _event_queues:
+                for queue in _event_queues[thread_id]:
+                    await queue.put(hitl_payload)
+
+            await session_mgr.save_session(
+                thread_id=thread_id,
+                query=query,
+                status="awaiting_human_review",
+                metadata={"iteration": state_values.get("iteration", 0)},
+            )
+            # Do NOT send "complete" — the graph is paused, not done
+            return
+
+        # ── Graph completed normally ─────────────────────────
         final_state = last_state if isinstance(last_state, dict) else {}
         report = final_state.get("report", "")
         status = final_state.get("status", "complete")
@@ -271,6 +313,13 @@ async def stream_research(thread_id: str):
 def _map_node_to_sse_event(node_name: str, output: dict) -> dict[str, Any]:
     """Map a graph node update to an SSE event type and payload.
 
+    Restructures the raw graph output into the format the frontend expects:
+    - ``search_results`` → ``results`` (with url/title/snippet per item)
+    - ``scraped_content`` → ``pages`` (with url/title per item)
+    - ``analysis`` dict → flat ``findings``, ``conflicts``, ``gaps``
+    - ``report`` → ``content``
+    - node name → ``agent``, status → ``message``
+
     Args:
         node_name: The name of the graph node that produced the update.
         output: The state update dict from the node.
@@ -278,6 +327,15 @@ def _map_node_to_sse_event(node_name: str, output: dict) -> dict[str, Any]:
     Returns:
         A dict with ``type`` and ``data`` keys for SSE serialization.
     """
+    _AGENT_DISPLAY_NAMES: dict[str, str] = {
+        "supervisor": "Planner",
+        "web_searcher": "Searcher",
+        "content_reader": "Extractor",
+        "analyst": "Analyzer",
+        "writer": "Writer",
+        "human_review": "Reviewer",
+    }
+
     event_map: dict[str, str] = {
         "supervisor": "status",
         "web_searcher": "search_result",
@@ -289,23 +347,56 @@ def _map_node_to_sse_event(node_name: str, output: dict) -> dict[str, Any]:
 
     event_type = event_map.get(node_name, "status")
 
-    # Build a serializable payload from the output
-    data: dict[str, Any] = {"node": node_name}
+    # Build a serializable payload matching the frontend's expected schema
+    data: dict[str, Any] = {
+        "node": node_name,
+        "agent": _AGENT_DISPLAY_NAMES.get(node_name, node_name),
+    }
 
     if "status" in output:
         data["status"] = output["status"]
+        data["message"] = output["status"].replace("_", " ").title()
+
+    # Search results: frontend reads `data.results[]`
     if "search_results" in output:
-        data["search_results"] = output["search_results"]
+        data["results"] = [
+            {
+                "url": r.get("url", ""),
+                "title": r.get("title", ""),
+                "snippet": r.get("snippet", r.get("content", "")),
+            }
+            for r in output["search_results"]
+        ]
+
+    # Scraped content: frontend reads `data.pages[]`
     if "scraped_content" in output:
-        data["scraped_content"] = output["scraped_content"]
-    if "analysis" in output:
-        data["analysis"] = output["analysis"]
+        data["pages"] = [
+            {
+                "url": p.get("url", ""),
+                "title": p.get("title", ""),
+            }
+            for p in output["scraped_content"]
+        ]
+
+    # Analysis: frontend reads `data.findings`, `data.conflicts`, `data.gaps`
+    if "analysis" in output and isinstance(output["analysis"], dict):
+        analysis = output["analysis"]
+        data["findings"] = analysis.get("key_findings", [])
+        data["conflicts"] = analysis.get("conflicts", [])
+        data["gaps"] = analysis.get("knowledge_gaps", [])
+
+    # Report: frontend reads `data.content`
     if "report" in output:
-        data["report"] = output["report"]
+        data["content"] = output["report"]
+
     if "errors" in output:
         data["errors"] = output["errors"]
+
+    # Human review: frontend reads `data.reason` and `data.conflicts`
     if "human_feedback" in output:
         data["human_feedback"] = output["human_feedback"]
+    if node_name == "human_review" and "analysis" in output and isinstance(output["analysis"], dict):
+        data["reason"] = output["analysis"].get("review_reason", "Human review requested")
 
     return {"type": event_type, "data": data}
 

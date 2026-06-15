@@ -398,22 +398,22 @@
 
   // ── Event Handlers ────────────────────────────────────────
   function handleStatusEvent(data) {
-    const agentName = data.agent || 'System';
-    const message = data.message || '';
+    const agentName = data.agent || data.node || 'System';
+    const message = data.message || data.status || '';
 
     updatePipeline(agentName);
     addActivityEvent('status', getAgentEmoji(agentName), agentName, message);
   }
 
   function handleSearchResultEvent(data) {
-    const results = data.results || [];
+    const results = data.results || data.search_results || [];
     const count = results.length;
 
     let detailsHtml = '';
     if (results.length) {
       detailsHtml = '<div class="search-results-chips">';
       results.forEach((r) => {
-        detailsHtml += `<a class="result-chip" href="${escapeHtml(r.url)}" target="_blank" rel="noopener" title="${escapeHtml(r.snippet || '')}">
+        detailsHtml += `<a class="result-chip" href="${escapeHtml(r.url)}" target="_blank" rel="noopener" title="${escapeHtml(r.snippet || r.content || '')}">
           <span class="result-chip-icon">🔗</span>
           ${escapeHtml(truncate(r.title || r.url, 40))}
         </a>`;
@@ -426,7 +426,7 @@
   }
 
   function handleContentEvent(data) {
-    const pages = data.pages || [];
+    const pages = data.pages || data.scraped_content || [];
     let detailsHtml = '<div class="event-details">';
     pages.forEach((p) => {
       detailsHtml += `<div class="event-details-item">
@@ -439,9 +439,11 @@
   }
 
   function handleAnalysisEvent(data) {
-    const findings = data.findings || [];
-    const conflicts = data.conflicts || [];
-    const gaps = data.gaps || [];
+    // Support both flat format (data.findings) and nested format (data.analysis.key_findings)
+    const analysis = data.analysis || {};
+    const findings = data.findings || analysis.key_findings || [];
+    const conflicts = data.conflicts || analysis.conflicts || [];
+    const gaps = data.gaps || analysis.knowledge_gaps || [];
 
     let detailsHtml = '<div class="analysis-cards">';
     detailsHtml += `<div class="analysis-card">
@@ -463,7 +465,7 @@
   }
 
   function handleReportEvent(data) {
-    const content = data.content || '';
+    const content = data.content || data.report || '';
     state.reportMarkdown = content;
 
     dom.reportContainer.classList.remove('hidden');
@@ -604,7 +606,12 @@
 
       dom.hitlModal.classList.add('hidden');
       addActivityEvent('status', '💬', 'You', `Feedback: "${truncate(feedback, 80)}"`);
-      showToast('Feedback submitted', 'success');
+      showToast('Feedback submitted — resuming research...', 'success');
+
+      // Reconnect the SSE stream to pick up events from the resumed graph.
+      // The old connection may still be alive (heartbeating), but reconnecting
+      // ensures we don't miss events if it timed out.
+      connectStream(state.currentThreadId);
     } catch (err) {
       showToast(err.message, 'error');
     } finally {
