@@ -529,9 +529,7 @@
     analysis: 'agentAnalyzer',
     writer: 'agentWriter',
     report: 'agentWriter',
-    reviewer: 'agentReviewer',
-    review: 'agentReviewer',
-    human: 'agentReviewer',
+    critic: 'agentCritic',
   };
 
   function updatePipeline(agentName) {

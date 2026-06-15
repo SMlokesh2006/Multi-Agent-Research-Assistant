@@ -123,10 +123,10 @@
             <div class="iteration-control">
               <label for="maxIterations">Depth</label>
               <select id="maxIterations">
-                <option value="1">Quick (1)</option>
-                <option value="2">Standard (2)</option>
-                <option value="3" selected>Deep (3)</option>
-                <option value="5">Exhaustive (5)</option>
+                <option value="1">Quick (0 extra passes)</option>
+                <option value="3">Standard (2 extra passes)</option>
+                <option value="5" selected>Deep (4 extra passes)</option>
+                <option value="7">Exhaustive (6 extra passes)</option>
               </select>
             </div>
             <button class="btn-research" id="btnStartResearch" disabled>
@@ -202,9 +202,9 @@
           <div class="agent-status-line"></div>
         </div>
         <div class="pipeline-connector"><div class="connector-line"></div></div>
-        <div class="pipeline-agent" data-agent="reviewer" id="agentReviewer">
-          <div class="agent-icon">👁️</div>
-          <div class="agent-label">Reviewer</div>
+        <div class="pipeline-agent" data-agent="critic" id="agentCritic">
+          <div class="agent-icon">⚖️</div>
+          <div class="agent-label">Critic</div>
           <div class="agent-status-line"></div>
         </div>
       </div>

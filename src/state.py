@@ -115,8 +115,6 @@ class AnalysisResult:
     conflicts: list[str] = field(default_factory=list)
     knowledge_gaps: list[str] = field(default_factory=list)
     follow_up_queries: list[str] = field(default_factory=list)
-    needs_human_review: bool = False
-    review_reason: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -124,8 +122,6 @@ class AnalysisResult:
             "conflicts": self.conflicts,
             "knowledge_gaps": self.knowledge_gaps,
             "follow_up_queries": self.follow_up_queries,
-            "needs_human_review": self.needs_human_review,
-            "review_reason": self.review_reason,
         }
 
     @classmethod
@@ -135,8 +131,6 @@ class AnalysisResult:
             conflicts=data.get("conflicts", []),
             knowledge_gaps=data.get("knowledge_gaps", []),
             follow_up_queries=data.get("follow_up_queries", []),
-            needs_human_review=data.get("needs_human_review", False),
-            review_reason=data.get("review_reason", ""),
         )
 
 
@@ -163,6 +157,7 @@ class ResearchState(TypedDict, total=False):
 
     # ── Analysis phase ───────────────────────────────────────
     analysis: dict | None  # Structured analysis (serialized AnalysisResult)
+    critique: Annotated[str, take_latest]  # Evaluation from Critic agent
 
     # ── Output phase ─────────────────────────────────────────
     report: str  # Final markdown report

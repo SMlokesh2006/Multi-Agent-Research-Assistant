@@ -104,34 +104,6 @@ def _parse_analysis_json(raw_text: str) -> dict:
     return json.loads(text)
 
 
-def _determine_needs_review(analysis: AnalysisResult) -> tuple[bool, str]:
-    """Decide whether the analysis needs human review.
-
-    Triggers review when:
-    - ≥ 2 conflicting claims are detected.
-    - Any finding has confidence below 0.5.
-    - ≥ 3 knowledge gaps are identified.
-
-    Returns:
-        (needs_review, reason) tuple.
-    """
-    reasons: list[str] = []
-
-    if len(analysis.conflicts) >= 2:
-        reasons.append(f"{len(analysis.conflicts)} conflicting claims detected across sources")
-
-    low_confidence = [f for f in analysis.key_findings if f.confidence < 0.5]
-    if low_confidence:
-        reasons.append(f"{len(low_confidence)} findings have low confidence (< 0.5)")
-
-    if len(analysis.knowledge_gaps) >= 3:
-        reasons.append(f"{len(analysis.knowledge_gaps)} significant knowledge gaps identified")
-
-    if reasons:
-        return True, "; ".join(reasons)
-    return False, ""
-
-
 async def analyst(state: ResearchState) -> dict[str, Any]:
     """Analyse all scraped content and produce structured findings.
 
@@ -239,17 +211,12 @@ async def analyst(state: ResearchState) -> dict[str, Any]:
         follow_up_queries=parsed.get("follow_up_queries", []),
     )
 
-    needs_review, review_reason = _determine_needs_review(analysis)
-    analysis.needs_human_review = needs_review
-    analysis.review_reason = review_reason
-
     analysis_dict = analysis.to_dict()
     await cache.set("llm", cache_key, analysis_dict)
 
     logger.info(
         f"analyst: {len(findings)} findings, "
-        f"{len(analysis.conflicts)} conflicts, "
-        f"needs_review={needs_review}"
+        f"{len(analysis.conflicts)} conflicts"
     )
 
     return {

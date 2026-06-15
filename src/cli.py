@@ -25,7 +25,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Prompt
 from rich.table import Table
 
-from src.graph import HUMAN_REVIEW, create_graph
+from src.graph import create_graph
 from src.persistence import get_checkpointer, get_session_manager
 from src.state import create_initial_state
 
@@ -181,40 +181,12 @@ async def run_cli(query: str, max_iterations: int = 3) -> None:
                 console.print(f"[bold red]Pipeline error: {e}[/bold red]")
                 break
 
-        # Check if the graph is interrupted (HITL)
+        # Check if the graph is done
         state = await graph.aget_state(config)
-        if state.next and HUMAN_REVIEW in state.next:
-            interrupted = True
-            # Show analysis context for review
-            current_state = state.values
-            if current_state.get("analysis"):
-                _display_analysis(current_state["analysis"])
-                reason = current_state["analysis"].get("review_reason", "Analysis requires review")
-                console.print(
-                    Panel(
-                        f"[bold yellow]The analyst flagged this for review:[/bold yellow]\n{reason}",
-                        title="👀 Human Review Required",
-                        border_style="yellow",
-                        width=80,
-                    )
-                )
-
-            # Prompt user
-            feedback = Prompt.ask(
-                "\n[bold]Your feedback[/bold] (or 'approve' to continue, 'stop' to end)"
-            )
-
-            if feedback.lower() == "stop":
-                console.print("[yellow]Research stopped by user.[/yellow]")
-                break
-
-            if feedback.lower() == "approve":
-                feedback = "Approved. Continue with the current findings."
-
-            from langgraph.types import Command
-
-            current_input = Command(resume=feedback)
-            continue
+        if not state.next:
+            break
+        
+        current_input = None
 
         # If not interrupted, we're done
         if not interrupted:

@@ -176,6 +176,14 @@ async def _run_research_background(
             # Build the HITL event payload from the current graph state
             state_values = graph_state.values or {}
             analysis = state_values.get("analysis") or {}
+            messages = state_values.get("messages", [])
+            
+            reason = "The research agents need your input to proceed."
+            if messages and hasattr(messages[-1], "content"):
+                msg_content = messages[-1].content
+                if isinstance(msg_content, str) and "Human review requested:" in msg_content:
+                    reason = msg_content.split("Human review requested:")[-1].strip()
+
             hitl_payload = {
                 "type": "human_review",
                 "data": {
@@ -183,7 +191,7 @@ async def _run_research_background(
                     "agent": "Reviewer",
                     "status": "awaiting_human_review",
                     "message": "Awaiting Human Review",
-                    "reason": analysis.get("review_reason", "The research agents need your input to proceed."),
+                    "reason": reason,
                     "conflicts": analysis.get("conflicts", []),
                     "findings": analysis.get("key_findings", []),
                     "gaps": analysis.get("knowledge_gaps", []),
@@ -332,8 +340,8 @@ def _map_node_to_sse_event(node_name: str, output: dict) -> dict[str, Any]:
         "web_searcher": "Searcher",
         "content_reader": "Extractor",
         "analyst": "Analyzer",
+        "critic": "Critic",
         "writer": "Writer",
-        "human_review": "Reviewer",
     }
 
     event_map: dict[str, str] = {
@@ -341,8 +349,8 @@ def _map_node_to_sse_event(node_name: str, output: dict) -> dict[str, Any]:
         "web_searcher": "search_result",
         "content_reader": "content",
         "analyst": "analysis",
+        "critic": "status",
         "writer": "report",
-        "human_review": "human_review",
     }
 
     event_type = event_map.get(node_name, "status")
